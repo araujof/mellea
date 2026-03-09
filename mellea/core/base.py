@@ -216,6 +216,14 @@ class ModelOutputThunk(CBlock, Generic[S]):
 
         self._generate_log: GenerateLog | None = None
 
+        # Stream-chunk hook support.  ``_on_stream_chunk`` is set by the backend
+        # wrapper (backend.py) when plugins are active.  ``_chunk_counter`` tracks
+        # the global 0-based index across multiple ``astream()`` calls.
+        self._chunk_counter: int = 0
+        self._on_stream_chunk: (
+            Callable[[ModelOutputThunk, str, str, int, bool], Coroutine] | None
+        ) = None
+
     def _copy_from(self, other: ModelOutputThunk) -> None:
         """Copy computed-output fields from *other* into *self*.
 
@@ -348,9 +356,22 @@ class ModelOutputThunk(CBlock, Generic[S]):
                 del self._meta["_telemetry_span"]
             raise chunks[-1]
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             assert self._process is not None
+            prev_accumulated = self._underlying_value or ""
             await self._process(self, chunk)
+
+            if self._on_stream_chunk is not None:
+                new_accumulated = self._underlying_value or ""
+                chunk_text = new_accumulated[len(prev_accumulated) :]
+                is_final = do_set_computed and i == len(chunks) - 1
+                result_accumulated = await self._on_stream_chunk(
+                    self, chunk_text, new_accumulated, self._chunk_counter, is_final
+                )
+                if result_accumulated is not None:
+                    self._underlying_value = result_accumulated
+
+            self._chunk_counter += 1
 
         if do_set_computed:
             assert self._underlying_value is not None

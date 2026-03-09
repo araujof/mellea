@@ -982,3 +982,233 @@ class TestSamplingLoopEndMutation:
 
         assert not sampling_result.success
         assert sampling_result.result is replacement
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk streaming backend for generation_stream_chunk tests
+# ---------------------------------------------------------------------------
+
+
+class _MockMultiChunkBackend(Backend):
+    """Backend that streams a configurable sequence of text chunks.
+
+    Enqueues each string in ``chunks`` as a separate item, followed by the
+    sentinel ``None``.  ``_chunk_size = 0`` forces ``astream()`` to process
+    one chunk at a time so tests get deterministic per-call behaviour.
+    """
+
+    model_id = "mock-stream-model"
+
+    def __init__(self, chunks: list[str] | None = None, *args, **kwargs):
+        self._chunks = chunks if chunks is not None else ["hello", " ", "world"]
+
+    async def generate_from_context(self, action, ctx, **kwargs):
+        import asyncio
+
+        mot = ModelOutputThunk(value=None)
+        mot._generate_type = GenerateType.ASYNC
+        mot._chunk_size = 0
+        mot._action = action
+
+        async def _process(thunk, chunk):
+            if thunk._underlying_value is None:
+                thunk._underlying_value = ""
+            thunk._underlying_value += str(chunk)
+
+        async def _post_process(thunk):
+            pass
+
+        mot._process = _process
+        mot._post_process = _post_process
+
+        glog = GenerateLog()
+        glog.prompt = "stream mocked prompt"
+        mot._generate_log = glog
+
+        chunks = self._chunks
+
+        async def _generate():
+            for c in chunks:
+                await mot._async_queue.put(c)
+            await mot._async_queue.put(None)  # sentinel
+
+        mot._generate = asyncio.ensure_future(_generate())
+
+        return mot, SimpleContext()
+
+    async def generate_from_raw(self, actions, ctx, **kwargs):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# generation_stream_chunk hook call sites
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationStreamChunkHookCallSites:
+    """GENERATION_STREAM_CHUNK fires once per chunk during lazy/streaming materialization."""
+
+    async def test_stream_chunk_fires_for_each_chunk(self) -> None:
+        """Hook fires exactly once per enqueued chunk."""
+        observed: list[Any] = []
+
+        @hook("generation_stream_chunk")
+        async def recorder(payload: Any, ctx: Any) -> Any:
+            observed.append(payload)
+            return None
+
+        register(recorder)
+        backend = _MockMultiChunkBackend(["a", "b", "c"])
+        result, _ = await backend.generate_from_context(
+            CBlock("fire count"), MagicMock(spec=Context)
+        )
+        await result.avalue()
+
+        assert len(observed) == 3
+
+    async def test_stream_chunk_payload_fields(self) -> None:
+        """Payload carries chunk text, accumulated text, chunk_index, and is_final."""
+        observed: list[Any] = []
+
+        @hook("generation_stream_chunk")
+        async def recorder(payload: Any, ctx: Any) -> Any:
+            observed.append(payload)
+            return None
+
+        register(recorder)
+        backend = _MockMultiChunkBackend(["hello", " world"])
+        result, _ = await backend.generate_from_context(
+            CBlock("payload check"), MagicMock(spec=Context)
+        )
+        await result.avalue()
+
+        assert len(observed) == 2
+        p0, p1 = observed
+
+        assert p0.chunk == "hello"
+        assert p0.accumulated == "hello"
+        assert p0.chunk_index == 0
+        assert p0.is_final is False
+
+        assert p1.chunk == " world"
+        assert p1.accumulated == "hello world"
+        assert p1.chunk_index == 1
+        assert p1.is_final is True
+
+    async def test_stream_chunk_index_increments_monotonically(self) -> None:
+        """chunk_index is 0-based and increments by 1 per chunk."""
+        indices: list[int] = []
+
+        @hook("generation_stream_chunk")
+        async def recorder(payload: Any, ctx: Any) -> Any:
+            indices.append(payload.chunk_index)
+            return None
+
+        register(recorder)
+        backend = _MockMultiChunkBackend(["x", "y", "z", "w"])
+        result, _ = await backend.generate_from_context(
+            CBlock("index test"), MagicMock(spec=Context)
+        )
+        await result.avalue()
+
+        assert indices == [0, 1, 2, 3]
+
+    async def test_stream_chunk_is_final_only_on_last_chunk(self) -> None:
+        """is_final is True only for the last chunk in the stream."""
+        is_finals: list[bool] = []
+
+        @hook("generation_stream_chunk")
+        async def recorder(payload: Any, ctx: Any) -> Any:
+            is_finals.append(payload.is_final)
+            return None
+
+        register(recorder)
+        backend = _MockMultiChunkBackend(["p", "q", "r"])
+        result, _ = await backend.generate_from_context(
+            CBlock("is_final test"), MagicMock(spec=Context)
+        )
+        await result.avalue()
+
+        assert is_finals == [False, False, True]
+
+    async def test_stream_chunk_chunk_modification_applied(self) -> None:
+        """A plugin that modifies ``chunk`` has the change reflected in the final output."""
+
+        @hook("generation_stream_chunk")
+        async def redact(payload: Any, ctx: Any) -> Any:
+            if payload.chunk == "secret":
+                modified = payload.model_copy(update={"chunk": "[REDACTED]"})
+                return PluginResult(continue_processing=True, modified_payload=modified)
+            return None
+
+        register(redact)
+        backend = _MockMultiChunkBackend(["hello ", "secret", "!"])
+        result, _ = await backend.generate_from_context(
+            CBlock("chunk mutation"), MagicMock(spec=Context)
+        )
+        value = await result.avalue()
+
+        assert "secret" not in value
+        assert "[REDACTED]" in value
+
+    async def test_stream_chunk_accumulated_modification_applied(self) -> None:
+        """A plugin that modifies ``accumulated`` has the change reflected in the final value."""
+
+        @hook("generation_stream_chunk")
+        async def override_accumulated(payload: Any, ctx: Any) -> Any:
+            if payload.is_final:
+                modified = payload.model_copy(update={"accumulated": "OVERRIDDEN"})
+                return PluginResult(continue_processing=True, modified_payload=modified)
+            return None
+
+        register(override_accumulated)
+        backend = _MockMultiChunkBackend(["foo", "bar"])
+        result, _ = await backend.generate_from_context(
+            CBlock("accumulated mutation"), MagicMock(spec=Context)
+        )
+        value = await result.avalue()
+
+        assert value == "OVERRIDDEN"
+
+    async def test_stream_chunk_fires_before_post_call(self) -> None:
+        """generation_stream_chunk fires before generation_post_call."""
+        order: list[str] = []
+
+        @hook("generation_stream_chunk")
+        async def stream_recorder(payload: Any, ctx: Any) -> Any:
+            order.append("stream_chunk")
+            return None
+
+        @hook("generation_post_call")
+        async def post_recorder(payload: Any, ctx: Any) -> Any:
+            order.append("post_call")
+            return None
+
+        register(stream_recorder)
+        register(post_recorder)
+        backend = _MockMultiChunkBackend(["one", "two"])
+        result, _ = await backend.generate_from_context(
+            CBlock("ordering"), MagicMock(spec=Context)
+        )
+        await result.avalue()
+
+        # stream_chunk fires twice (one per chunk), then post_call fires once
+        assert order == ["stream_chunk", "stream_chunk", "post_call"]
+
+    async def test_stream_chunk_not_fired_on_eager_mot(self) -> None:
+        """GENERATION_STREAM_CHUNK does not fire for already-computed (eager) MOTs."""
+        observed: list[Any] = []
+
+        @hook("generation_stream_chunk")
+        async def recorder(payload: Any, ctx: Any) -> Any:
+            observed.append(payload)
+            return None
+
+        register(recorder)
+        # _MockBackend returns an already-computed MagicMock MOT (eager path)
+        backend = _MockBackend()
+        await backend.generate_from_context(
+            CBlock("eager test"), MagicMock(spec=Context)
+        )
+
+        assert observed == []

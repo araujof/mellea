@@ -220,6 +220,41 @@ class Backend(abc.ABC):
 
                 out_result._on_computed = _fire_post_call
 
+                async def _fire_stream_chunk(
+                    mot: ModelOutputThunk,
+                    chunk_text: str,
+                    accumulated: str,
+                    chunk_index: int,
+                    is_final: bool,
+                ) -> str | None:
+                    """Fires GENERATION_STREAM_CHUNK and returns the effective new accumulated string if plugins modified it, else ``None``."""
+                    if not has_plugins(HookType.GENERATION_STREAM_CHUNK):
+                        return None
+                    from ..plugins.hooks.generation import GenerationStreamChunkPayload
+
+                    stream_payload = GenerationStreamChunkPayload(
+                        chunk=chunk_text,
+                        accumulated=accumulated,
+                        chunk_index=chunk_index,
+                        is_final=is_final,
+                    )
+                    _, stream_payload = await invoke_hook(
+                        HookType.GENERATION_STREAM_CHUNK,
+                        stream_payload,
+                        backend=_backend_ref,
+                    )
+                    if stream_payload.accumulated != accumulated:
+                        return stream_payload.accumulated
+                    if stream_payload.chunk != chunk_text:
+                        # Plugin modified only chunk — rebuild accumulated
+                        if accumulated.endswith(chunk_text):
+                            return (
+                                accumulated[: -len(chunk_text)] + stream_payload.chunk
+                            )
+                    return None
+
+                out_result._on_stream_chunk = _fire_stream_chunk
+
                 # For already-computed MOTs (e.g. cached responses or test mocks),
                 # astream() returns early so _on_computed never fires. Fire here
                 # and use the return value to support model_output replacement.
